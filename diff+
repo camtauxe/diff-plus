@@ -1,0 +1,376 @@
+#!/usr/bin/perl
+use v5.26;
+use experimental 'switch';
+
+=head1 NAME
+
+diff+ - Analyze the differences among many files
+
+=head1 SYNOPSIS
+
+diff+ [-h|--help] [-o|--options DIFF_OPTS] FILE...
+
+=head1 DESCRIPTION
+
+Diff+ is an interactive tool to analyze the diffs between many files.
+Conceptually, it sorts all of the files specified on the command-line
+into distinct "groups" where all of the files in a group are identical
+to one another. It then enters an interactive main loop where the user
+can enter commands to view the difference between groups, see all of the
+files in a group, and more.
+
+Generally, the group that contains the most files will be considered the
+"base" group. By default, diffs shown by the program are considered to be
+relative to this base. Although the user is free to change the base group
+or specify a more specific diff if they so choose.
+
+=head2 OPTIONS
+
+=over 4
+
+=item * B<h|help>
+
+Print usage and exit.
+
+=item * B<o|options>
+
+Specify options to pass to diff when diff'ing files. This option can be listed
+multiple times with all the values being passed in-order to diff. Alternatively,
+a single value can contain multiple options which will be separated by
+whitespace.
+
+=back
+
+=cut
+
+##############
+# INIT
+#############
+
+use Getopt::Long qw(:config auto_help);
+use Pod::Usage qw(pod2usage);
+
+my @diffopts;
+GetOptions(
+    "o|options=s" => \@diffopts
+);
+@diffopts = split ' ', join ' ', @diffopts;
+# Die if no arguments specified
+pod2usage("No files specified") unless (@ARGV);
+
+# Set LESSSECURE so that less runs in secure mode
+$ENV{'LESSSECURE'} = "1";
+
+# diffgroups represents the groups of diff'ed files
+# Each element of the array is an array ref
+# containing the filenames of all of the files in that group
+my @diffgroups;
+
+# Analyze files
+say "Diffing files...";
+say "Using options for diff: ", join ' ', @diffopts if (@diffopts);
+my $numgroups = 0;
+my $numfiles = 0;
+
+# Iterate through files listed in arguments
+foreach my $file (@ARGV) {
+    (-e $file && -r $file) || die "$file does not exist or is not readable";
+
+    # Iterate through existing groups to find one that matches
+    my $matchfound = 0;
+    foreach my $comparegroup (@diffgroups) {
+        # Compare to the first file in the group
+        # (all files in a group are identical so it doesn't matter which)
+        my $comparefile = $comparegroup->[0];
+
+        {
+            # Temporarily redirect STDOUT
+            open(local *STDOUT, '>', '/dev/null');
+            open STDOUT, '-|', ('diff', @diffopts, $comparefile, $file);
+            wait;
+        }
+
+        # Switch on 'diff' exit code
+        given ($? >> 8) {
+            when (0) { # Files match
+                push @{$comparegroup}, $file;
+                $matchfound = 1;
+                last;
+            } 
+            when (1) { # Files differ
+                next;
+            }
+            default {
+                die "diff encountered an error";
+            }
+        }
+
+    }
+    # Create and append a new group if no matching group was found
+    if (not $matchfound) {
+        push @diffgroups, [$file];
+    }
+} continue {
+    $numfiles++;
+}
+
+$numgroups = @diffgroups;
+say "Found $numgroups different groups across $numfiles files.";
+
+# Sort groups by size (decreasing)
+@diffgroups = reverse sort { (@$a <=> @$b) } @diffgroups;
+
+# Determine initial base group
+my $basegroup = 0;
+my $maxlength = @{$diffgroups[$basegroup]};
+foreach (0..$numgroups-1) {
+    if ((my $length = @{$diffgroups[$_]}) > $maxlength) {
+        $maxlength = $length;
+        $basegroup = $_;
+    }
+}
+say "Group $basegroup has the most files ($maxlength) and will be used as the base.";
+
+###########
+# MAIN LOOP
+###########
+
+say "";
+list_all_groups();
+
+my $promptstring = '> ';
+
+=head2 COMMANDS
+
+After all the files have been organized, the user can enter commands
+one-at-a-time to interact with the program. The following commands are
+available:
+
+=for comment
+(The documentation for each command is in the switch statement below
+next to each command's case)
+
+=over 4
+
+=cut
+
+say "\nEnter a command ('?' or 'h' for help)";
+print $promptstring;
+while (<STDIN>) {
+    chomp;
+    (my $command, my @args) = split;
+    
+    given ($command) {
+=item * B<b|base GROUP>
+
+Set the base group to the specified group.
+=cut
+        when (['b', 'base']) {
+            $basegroup = my $group = parse_group_spec(shift @args);
+            say "Base set to group $group.";
+            list_all_groups();
+        }
+=item * B<d|diff GROUP [GROUP]>
+
+View the diff of the two groups (technically, the first files of each group).
+If the second group is unspecified, then the first group will be diffed against
+the base. Output is piped into less.
+=cut
+    when (['d', 'diff']) {
+        use File::Temp;
+
+        (my $groupA, my $groupB) = @args[0..1];
+        $groupB //= $basegroup;
+        $_ = parse_group_spec($_) foreach ($groupA, $groupB);
+        (my $fileA, my $fileB) = map {@{$diffgroups[$_]}[0]} ($groupA, $groupB);
+
+        my $temp = File::Temp->new();
+        # Temporaily change stdout to write diff to temp file
+        open(my $oldstdout, '>&STDOUT');
+        open(STDOUT, '>&', $temp);
+        system('diff', @diffopts, $fileA, $fileB);
+        open(STDOUT, '>&', $oldstdout);
+
+        # Call less
+        system('less', '-R', $temp->filename);
+    }
+=item * B<ls|l|list GROUP...>
+
+List all of the files in one or more groups.
+=cut
+    when(['ls','l','list']) {
+        my @groups = map {parse_group_spec($_)} @args;
+        foreach my $group (@groups) {
+            say ">>> Group $group <<<";
+            foreach my $file (@{$diffgroups[$group]}) {
+                say "$file";
+            }
+            say "";
+        }
+    }
+=item * B<v|view>
+
+Print a list of all of the groups.
+=cut
+    when (['v','view']) {
+        list_all_groups();
+    }
+=item * B<h|help|?>
+
+List available commands
+=cut
+    when (['?','h','help']) {
+        print <<'HELPTEXT';
+b|base      - Set base group
+d|diff      - View the diff between two groups
+ls|l|list   - List the files in groups
+v|view      - See list of groups
+h|help|?    - See this help
+w|what      - See group index
+q|quit      - Quit
+(See the man page for more details)
+HELPTEXT
+    }
+=item * B<w|what GROUP...>
+
+Report the index of each specified group. Mainly useful for seeing what a 
+regex GROUP spec will resolve to.
+=cut
+        when (['w', 'what']) {
+            say parse_group_spec($_) foreach (@args);
+        }
+=item * B<q|quit|e|exit>
+
+Exit
+=cut
+        when(['q', 'quit', 'e', 'exit']) {
+            say "Bye";
+            exit 0;
+        }
+=back
+=cut
+        default {
+            say "Unrecognized command: $_";
+        }
+    }
+
+    say "";
+    print $promptstring;
+}
+
+##############
+# FUNCTIONS
+##############
+
+=pod
+
+In each of these commands, I<GROUP> refers to a single one of the groups and
+can be specified in one of three ways:
+
+=over 4
+
+=item * B<An Integer>:
+The integer index of the group.
+
+=item * B<'b' or 'base'>:
+The base group
+
+=item * Any other string will be interpreted as a regex and will match
+the group of the first filename it finds that matches it.
+
+=back
+
+=cut
+
+=for comment
+Parse a GROUP spec provided by the user.
+If unable to find a matching group, returns 'undef'
+=cut
+sub parse_group_spec ($) {
+    my $spec = shift @_;
+    given ($spec) {
+        # Match integer
+        when (/^-?\d+$/) {
+            if ($_ >= 0 && $_ <= $#diffgroups) {
+                return $_;
+            } else {
+                say "Invalid number ($_): Must be between 0 and $#diffgroups";
+                return undef;
+            }
+        }
+        # Match base group
+        when (['b','base']) {
+            return $basegroup;
+        }
+        # Match regex
+        default {
+            # Iterate through groups and filenames
+            foreach my $group (0..$numgroups-1) {
+                foreach my $filename (@{$diffgroups[$group]}) {
+                    if ($filename =~ /$spec/) {
+                        say "matched /$spec/ to $filename in group $group.";
+                        return $group;
+                    }
+                }
+            }
+            say "could not find matching file for /$spec/.";
+            return undef;
+        }
+    }
+}
+
+=for comment
+group_to_str GROUP INDEX SCREENWIDTH
+Return a string representing the specified group.
+(Group is specified by the actual array ref to the group)
+By default the string has the following format:
+    X file(s) : FILES...
+    Where X is the number of files in the group and FILES.. is a list
+    of all the filenames in the group.
+Alternatively, you can specify an explicit index in which case the following
+will be prepended to the string:
+    [Y ]:
+    Where Y is the given index (Y will also have an '*' after it if the
+    given index corresponds to the base group)
+If a screen width is specified, the string will be truncated to that length
+and display an '...' where it was cut off.
+=cut
+sub group_to_str {
+    my ($group, $index, $screenwidth) = @_;
+    $screenwidth //= 80;
+
+    my $str;
+    if (defined $index) {
+        if ($index == $basegroup) {
+            $str .= "[$index*]: "
+        } else {
+            $str .= "[$index ]: "
+        }
+    }
+
+    my $grouplength = @{$group};
+    $str .= "$grouplength file(s) : ";
+
+    foreach (@{$group}) {
+        $str .= $_ . " ";
+        last if (length($str) >= $screenwidth);
+    }
+
+    if (length($str) >= $screenwidth) {
+        $str = substr($str,0,$screenwidth-5) . "...";
+    }
+    return $str
+}
+
+=for comment
+Print a list of all the groups along with
+a header describing the number of groups and files.
+=cut
+sub list_all_groups {
+    say "$numgroups different groups across $numfiles files.";
+    say "The group marked with '*' is the current base.";
+    my $screenwidth = `tput cols`;
+    foreach (0..$numgroups-1) {
+        say group_to_str($diffgroups[$_], $_, $screenwidth);
+    }
+}
